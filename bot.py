@@ -325,7 +325,7 @@ if "fsub_channel_id" in _saved_settings:
 # same `settings` table (key = "msg_<name>") so they survive restarts.
 DEFAULT_MESSAGES = {
     "welcome_msg": "🧑‍💻",
-    "verify_msg": "🔒",
+    "verify_msg": "🗝️",
     "verified_msg": "✅",
     "gm_msg": "☀️",
     "help_msg": (
@@ -346,7 +346,7 @@ DEFAULT_MESSAGES = {
 # order + labels used to build the "Edit Messages" menu in the admin panel
 MESSAGE_LABELS = {
     "welcome_msg": "👋 Welcome Message",
-    "verify_msg": "🔒 Verify / Join Message",
+    "verify_msg": "🗝️ Verify / Join Message",
     "verified_msg": "🎉 Verified Success Message",
     "gm_msg": "☀️ Good Morning Message",
     "help_msg": "❓ Help Message",
@@ -716,7 +716,7 @@ async def download_handler(client: Client, message: Message):
         return
 
     if not await check_fsub(client, message.from_user.id):
-        await message.reply_text("🔒", reply_markup=fsub_join_kb())
+        await message.reply_text("🗝️", reply_markup=fsub_join_kb())
         return
 
     record_download_attempt(message.from_user.id)
@@ -735,26 +735,7 @@ async def download_handler(client: Client, message: Message):
 
     filename = None
     try:
-        progress_state = {"last_shown": 0}
-
-        def on_progress(d):
-            if d.get("status") != "downloading":
-                return
-            total = d.get("total_bytes") or d.get("total_bytes_estimate")
-            downloaded = d.get("downloaded_bytes", 0)
-            if not total:
-                return
-            pct = int((downloaded / total) * 100)
-            # Sirf 25% ke checkpoints pe update karo — Telegram edit rate-limit
-            # se bachne ke liye, har progress-tick pe edit nahi karte.
-            checkpoint = (pct // 25) * 25
-            if checkpoint > progress_state["last_shown"] and checkpoint < 100:
-                progress_state["last_shown"] = checkpoint
-                asyncio.create_task(_safe_edit(status_msg, f"🪪 {checkpoint}%"))
-
-        filename, info = await download_with_yt_dlp(
-            url, DOWNLOAD_DIR, filename_prefix=f"{message.from_user.id}_", progress_callback=on_progress
-        )
+        filename, info = await download_with_yt_dlp(url, DOWNLOAD_DIR, filename_prefix=f"{message.from_user.id}_")
         filesize = os.path.getsize(filename)
         await _safe_edit(status_msg, "📤")
 

@@ -71,6 +71,15 @@ DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "downloads")
 DB_PATH = os.getenv("DB_PATH", "kissu.db")
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Kolkata")
 
+# ----------------- Rate limiting -----------------
+# Har user ke recent-download-request timestamps track karte hain (sliding
+# window). Sirf 2 parallel downloads chalte hain (_EXEC max_workers=2), isliye
+# spam-requests download-queue ko jaam kar sakte hain — ye us se bachata hai.
+download_times = {}  # { user_id: [timestamp1, timestamp2, ...] }
+RATELIMIT_COUNT = 3
+RATELIMIT_WINDOW = 60   # seconds
+RATELIMIT_WAIT = 30     # seconds
+
 # ----------------- Cookies (for private Instagram / X content) -----------------
 # Two ways to provide login cookies, so downloads work for accounts (like a
 # private Instagram) that need to be logged in to view:
@@ -214,6 +223,28 @@ async def download_with_yt_dlp(url: str, download_dir: str, filename_prefix: str
 
     return await loop.run_in_executor(_EXEC, _run)
 
+
+async def estimate_filesize(url: str) -> Optional[int]:
+    """Metadata-only extract (download=False) taaki upload-limit check download
+    shuru karne se PEHLE ho sake. yt_dlp ka filesize estimate exact nahi hota
+    hamesha (kabhi filesize_approx milta hai, kabhi bilkul nahi) — is wajah se
+    ye best-effort hai: None milne pe caller download karke hi actual size
+    check karega (jo pehle se ho raha tha)."""
+    loop = asyncio.get_running_loop()
+    opts = {"quiet": True, "noplaylist": True, "skip_download": True}
+    if COOKIES_FILE and os.path.isfile(COOKIES_FILE):
+        opts["cookiefile"] = COOKIES_FILE
+
+    def _run():
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return info.get("filesize") or info.get("filesize_approx")
+
+    try:
+        return await loop.run_in_executor(_EXEC, _run)
+    except Exception:
+        return None
+
 # ----------------- Utils -----------------
 
 def human_size(n: int) -> str:
@@ -244,6 +275,7 @@ def cleanup_old_files(path: str, days: int = 3):
 URL_RE = re.compile(r"https?://[\w./?=&%-]+")
 INST_RE = re.compile(r"(instagram\.com|instagr\.am)")
 X_RE = re.compile(r"(x\.com|twitter\.com|t\.co)")
+YT_RE = re.compile(r"(youtube\.com|youtu\.be)")
 
 def is_command_text(text: Optional[str]) -> bool:
     return bool(text and text.startswith("/"))
@@ -292,13 +324,13 @@ if "fsub_channel_id" in _saved_settings:
 # are used until the admin overrides one; overrides are persisted in the
 # same `settings` table (key = "msg_<name>") so they survive restarts.
 DEFAULT_MESSAGES = {
-    "welcome_msg": "👋 Welcome {name}! Insta/X links bhejo, mai download karke dunga 🎬",
-    "verify_msg": "🔒 Pehle hamara channel join karo, phir niche 'Verify' dabao 👇",
-    "verified_msg": "✅ Verified! Welcome {name} 🎉",
-    "gm_msg": "☀️ Good Morning! Kuch download karna ho to link bhejo.",
+    "welcome_msg": "🧑‍💻",
+    "verify_msg": "🔒",
+    "verified_msg": "✅",
+    "gm_msg": "☀️",
     "help_msg": (
         "🤖 Help:\n"
-        "🔗 Insta/X links bhejo.\n"
+        "🔗 Insta/X/YouTube links bhejo.\n"
         "⬇️ Mai download karke file bhej dunga (agar Telegram allow kare).\n"
         "📞 Agar bahut badi file hui to contact admin @KissuADMIN.\n"
     ),
@@ -402,9 +434,13 @@ async def check_fsub(client: Client, user_id: int) -> bool:
         return True
     except UserNotParticipant:
         return False
-    except Exception:
-        # If cannot check (bot not admin/private), allow
-        return True
+    except Exception as e:
+        # Fail-CLOSED: koi bhi error (bot admin nahi hai, wrong channel ID, etc.)
+        # ka matlab hai "verify nahi ho paya" -> user ko not-joined treat karo.
+        # Fail-open (return True) ek misconfiguration se FSUB silently bypass
+        # kar deta — production me ye zyada risky hai.
+        logger.warning(f"FSUB check fail hua (fail-closed): {e}")
+        return False
 
 async def start_handler(client: Client, message: Message):
     uid = message.from_user.id
@@ -647,6 +683,20 @@ async def admin_input_receive(client: Client, message: Message):
         _admin_state["awaiting"] = None
 
 # main message handler for links
+def check_rate_limit(user_id: int) -> bool:
+    """Sliding-window rate limit: last RATELIMIT_WINDOW seconds me
+    RATELIMIT_COUNT ya usse zyada download-requests ki to True (blocked)."""
+    now = time.time()
+    history = download_times.get(user_id, [])
+    history = [t for t in history if now - t < RATELIMIT_WINDOW]
+    download_times[user_id] = history
+    return len(history) >= RATELIMIT_COUNT
+
+
+def record_download_attempt(user_id: int):
+    download_times.setdefault(user_id, []).append(time.time())
+
+
 async def download_handler(client: Client, message: Message):
     text = message.text.strip()
     urls = URL_RE.findall(text)
@@ -654,24 +704,57 @@ async def download_handler(client: Client, message: Message):
         return
     url = None
     for u in urls:
-        if INST_RE.search(u) or X_RE.search(u):
+        if INST_RE.search(u) or X_RE.search(u) or YT_RE.search(u):
             url = u
             break
     if not url:
-        await message.reply_text("⚠️ Sirf Instagram aur X links support karta hu abhi.")
+        await message.reply_text("⚠️")
+        return
+
+    if check_rate_limit(message.from_user.id):
+        await message.reply_text(f"🤖 Wait {RATELIMIT_WAIT}s....")
         return
 
     if not await check_fsub(client, message.from_user.id):
-        await message.reply_text(f"🔒 Pehle channel join kar lo: {_bot_settings['fsub_channel_link']}")
+        await message.reply_text("🔒", reply_markup=fsub_join_kb())
         return
 
+    record_download_attempt(message.from_user.id)
     await add_user(message.from_user.id, message.from_user.first_name or "User")
 
     status_msg = await message.reply_text("🪪", quote=True)
 
+    # Telegram bot API ka hard upload limit ~2GB hai, chahe video ho ya document.
+    # Pehle metadata se size estimate le lete hain — agar clearly 2GB se zyada
+    # hai to poori file download hi nahi karte (bandwidth/time/disk bachta hai).
+    HARD_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
+    estimated_size = await estimate_filesize(url)
+    if estimated_size and estimated_size > HARD_LIMIT_BYTES:
+        await _safe_edit(status_msg, "🚫")
+        return
+
     filename = None
     try:
-        filename, info = await download_with_yt_dlp(url, DOWNLOAD_DIR, filename_prefix=f"{message.from_user.id}_")
+        progress_state = {"last_shown": 0}
+
+        def on_progress(d):
+            if d.get("status") != "downloading":
+                return
+            total = d.get("total_bytes") or d.get("total_bytes_estimate")
+            downloaded = d.get("downloaded_bytes", 0)
+            if not total:
+                return
+            pct = int((downloaded / total) * 100)
+            # Sirf 25% ke checkpoints pe update karo — Telegram edit rate-limit
+            # se bachne ke liye, har progress-tick pe edit nahi karte.
+            checkpoint = (pct // 25) * 25
+            if checkpoint > progress_state["last_shown"] and checkpoint < 100:
+                progress_state["last_shown"] = checkpoint
+                asyncio.create_task(_safe_edit(status_msg, f"🪪 {checkpoint}%"))
+
+        filename, info = await download_with_yt_dlp(
+            url, DOWNLOAD_DIR, filename_prefix=f"{message.from_user.id}_", progress_callback=on_progress
+        )
         filesize = os.path.getsize(filename)
         await _safe_edit(status_msg, "📤")
 
@@ -685,7 +768,7 @@ async def download_handler(client: Client, message: Message):
             else:
                 await message.reply_document(document=filename, quote=True)
         except Exception:
-            await message.reply_text("⚠️ File bahut badi hai ya upload fail hua. Contact admin @Dinno07")
+            await message.reply_text("⚠️")
 
         await status_msg.delete()
         await add_download(message.from_user.id)
@@ -693,7 +776,7 @@ async def download_handler(client: Client, message: Message):
     except Exception as e:
         logger.exception("Download/upload failed")
         try:
-            await status_msg.edit_text(f"❌ Kuch gadbad hua: {e}")
+            await status_msg.edit_text("❌")
         except Exception:
             pass
     finally:
@@ -724,8 +807,11 @@ async def send_good_morning():
 def schedule_jobs(scheduler: AsyncIOScheduler):
     # cleanup at 03:05 daily
     scheduler.add_job(lambda: cleanup_old_files(DOWNLOAD_DIR, days=3), CronTrigger(hour=3, minute=5))
-    # morning message at 06:00
-    scheduler.add_job(lambda: asyncio.create_task(send_good_morning()), CronTrigger(hour=6, minute=0))
+    # morning message at 06:00 — AsyncIOScheduler coroutine functions ko seedha
+    # schedule kar sakta hai; asyncio.create_task() ka manual wrapping crash
+    # karta tha kyunki scheduler ka job apne thread me chalta hai jaha koi
+    # running event loop nahi hota.
+    scheduler.add_job(send_good_morning, CronTrigger(hour=6, minute=0))
 
 # ----------------- Run -----------------
 

@@ -324,7 +324,7 @@ if "fsub_channel_id" in _saved_settings:
 # are used until the admin overrides one; overrides are persisted in the
 # same `settings` table (key = "msg_<name>") so they survive restarts.
 DEFAULT_MESSAGES = {
-    "welcome_msg": "🧑‍💻",
+    "welcome_msg": "`X Insta YT` ka koi 1 video **Link** 🔗 do.",
     "verify_msg": "🗝️",
     "verified_msg": "✅",
     "gm_msg": "☀️",

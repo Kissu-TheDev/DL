@@ -470,7 +470,7 @@ async def account_handler(client: Client, message: Message):
 
 async def admin_handler(client: Client, message: Message):
     if message.from_user.id != ADMIN_ID:
-        await message.reply_text("🚫 Tu admin nahi hai bhai.")
+        await message.reply_text("❌")
         return
     _admin_state["awaiting"] = None
     await message.reply_text("🛠 Admin Panel:", reply_markup=admin_main_kb())
@@ -494,12 +494,12 @@ async def callback_handler(client: Client, query):
                 reply_markup=main_kb,
             )
         else:
-            await query.answer("❌ Abhi tak join nahi kiya bhai. Pehle channel join karo.", show_alert=True)
+            await query.answer("🚫 Abhi tak join nahi kiya bhai. Pehle channel join karo.", show_alert=True)
         return
 
     # ---- everything below is admin-only ----
     if query.from_user.id != ADMIN_ID:
-        await query.answer("🚫 Tu admin nahi hai bhai", show_alert=True)
+        await query.answer("❌", show_alert=True)
         return
 
     if data == "admin_stats":

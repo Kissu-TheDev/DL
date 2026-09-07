@@ -4,3 +4,6 @@ yt-dlp>=2024.1.0
 apscheduler>=3.9.1
 pytz>=2023.3
 python-dotenv>=1.0.0
+instaloader
+gallery-dl
+apscheduler

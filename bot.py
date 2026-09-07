@@ -36,6 +36,9 @@ try:
 except Exception:
     pass
 
+import subprocess
+from typing import List
+
 from pyrogram import Client, filters, idle
 from pyrogram.handlers import MessageHandler, CallbackQueryHandler
 from pyrogram.types import ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton, Message
@@ -44,6 +47,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 import pytz
 import yt_dlp
+import requests
+import instaloader
 
 # ----------------- Config / Env -----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -70,6 +75,26 @@ TELEGRAM_UPLOAD_LIMIT_MB = int(os.getenv("TELEGRAM_UPLOAD_LIMIT_MB", "50"))
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "downloads")
 DB_PATH = os.getenv("DB_PATH", "kissu.db")
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Kolkata")
+
+# ----------------- Instaloader login (optional) -----------------
+# Instaloader anonymous mode se public posts/reels download kar leta hai, lekin
+# private accounts, highlights, ya heavy usage pe Instagram jaldi rate-limit
+# karta hai. Agar ek logged-in session chahiye:
+#   1. Apne PC pe ek baar chalao: instaloader --login=<IG_USERNAME>
+#      (isse ek session file ~/.config/instaloader/ me ban jayegi)
+#   2. Wo file server pe upload karke IG_SESSION_FILE me uska path do,
+#      aur IG_USERNAME me wahi username do.
+IG_USERNAME = os.getenv("IG_USERNAME")
+IG_SESSION_FILE = os.getenv("IG_SESSION_FILE")
+
+# ----------------- Cobalt (universal free downloader API) -----------------
+# Cobalt (https://cobalt.tools) YouTube/Insta/X/TikTok/Reddit/etc ke liye ek
+# free hosted API deta hai — last-resort fallback jab baaki sab engines fail
+# ho jayein. Public instance ki URL/limits samay ke saath badal sakti hain,
+# isliye env se override karne ka option diya gaya hai. Kuch instances API
+# key maangte hain — COBALT_API_KEY set karo agar tumhare instance ko chahiye.
+COBALT_API_URL = os.getenv("COBALT_API_URL", "https://api.cobalt.tools/api/json")
+COBALT_API_KEY = os.getenv("COBALT_API_KEY")
 
 # ----------------- Rate limiting -----------------
 # Har user ke recent-download-request timestamps track karte hain (sliding
@@ -245,6 +270,214 @@ async def estimate_filesize(url: str) -> Optional[int]:
     except Exception:
         return None
 
+# ----------------- Multi-Engine Downloader -----------------
+# Ek hi link ke liye kai downloader "engines" try karte hain, order mein.
+# Pehla jo kaam kar jaye (files return kare) wahi use hota hai; agar wo fail
+# ho (exception ya khaali result) to automatically agla engine try hota hai.
+# Isse yt-dlp akela jo miss kar deta hai (jaise Instagram photo-carousels,
+# private posts, ya kuch niche/regional sites) wo instaloader/gallery-dl/
+# free public APIs se cover ho jata hai.
+
+IG_SHORTCODE_RE = re.compile(r"instagram\.com/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)")
+
+_IG_LOADER: Optional["instaloader.Instaloader"] = None
+
+def _get_instaloader() -> "instaloader.Instaloader":
+    """Instaloader instance ek hi baar banate hain (lazy singleton) taaki
+    session baar baar reload na ho."""
+    global _IG_LOADER
+    if _IG_LOADER is None:
+        L = instaloader.Instaloader(
+            download_videos=True,
+            download_video_thumbnails=False,
+            download_geotags=False,
+            download_comments=False,
+            save_metadata=False,
+            compress_json=False,
+            post_metadata_txt_pattern="",
+            quiet=True,
+        )
+        if IG_SESSION_FILE and IG_USERNAME and os.path.isfile(IG_SESSION_FILE):
+            try:
+                L.load_session_from_file(IG_USERNAME, IG_SESSION_FILE)
+                logger.info("Instaloader: logged-in session load ho gaya.")
+            except Exception:
+                logger.warning("Instaloader session load fail hua, anonymous mode use hoga.")
+        _IG_LOADER = L
+    return _IG_LOADER
+
+
+async def download_with_instaloader(url: str, download_dir: str, user_id: int) -> List[str]:
+    """Instagram posts/reels ke liye — carousels (multiple photos/videos) bhi
+    handle karta hai, jo yt-dlp aksar miss kar deta hai."""
+    m = IG_SHORTCODE_RE.search(url)
+    if not m:
+        return []
+    shortcode = m.group(1)
+    loop = asyncio.get_running_loop()
+
+    def _run():
+        L = _get_instaloader()
+        target_dir = os.path.join(download_dir, f"ig_{user_id}_{shortcode}")
+        os.makedirs(target_dir, exist_ok=True)
+        post = instaloader.Post.from_shortcode(L.context, shortcode)
+        L.download_post(post, target=target_dir)
+        files = []
+        for fn in sorted(os.listdir(target_dir)):
+            if fn.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".mp4")):
+                files.append(os.path.join(target_dir, fn))
+        return files
+
+    return await loop.run_in_executor(_EXEC, _run)
+
+
+async def download_with_gallery_dl(url: str, download_dir: str, user_id: int) -> List[str]:
+    """gallery-dl ek generic multi-site downloader hai — Instagram, Twitter/X,
+    Reddit, Pinterest, Tumblr, DeviantArt, Facebook photos, aur bahut saari
+    aur sites support karta hai. yt-dlp/instaloader fail hone par isko
+    fallback ki tarah use karte hain."""
+    loop = asyncio.get_running_loop()
+    target_dir = os.path.join(download_dir, f"gdl_{user_id}_{int(time.time() * 1000)}")
+    os.makedirs(target_dir, exist_ok=True)
+
+    cmd = ["gallery-dl", "--directory", target_dir, "-q"]
+    if COOKIES_FILE and os.path.isfile(COOKIES_FILE):
+        cmd += ["--cookies", COOKIES_FILE]
+    cmd.append(url)
+
+    def _run():
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+            if proc.returncode != 0:
+                logger.warning(f"gallery-dl exit {proc.returncode}: {(proc.stderr or '')[:300]}")
+        except FileNotFoundError:
+            logger.warning("gallery-dl command nahi mila (requirements.txt se install ho gaya hai check karo).")
+            return []
+        except subprocess.TimeoutExpired:
+            logger.warning("gallery-dl timeout ho gaya.")
+        files = []
+        for root, _dirs, fnames in os.walk(target_dir):
+            for fn in fnames:
+                if fn.lower().endswith((".json", ".part")):
+                    continue
+                files.append(os.path.join(root, fn))
+        return files
+
+    return await loop.run_in_executor(_EXEC, _run)
+
+
+async def download_with_ytdlp_multi(url: str, download_dir: str, user_id: int) -> List[str]:
+    """Existing yt-dlp downloader ko multi-file interface me wrap karta hai."""
+    fname, _info = await download_with_yt_dlp(url, download_dir, filename_prefix=f"{user_id}_")
+    return [fname] if fname and os.path.exists(fname) else []
+
+
+async def download_with_tikwm(url: str, download_dir: str, user_id: int) -> List[str]:
+    """TikTok ke liye free public API (tikwm.com, no-key) — no-watermark video
+    deta hai. Isse pehle try karte hain kyunki yt-dlp TikTok pe kabhi kabhi
+    IP/region ki wajah se block ho jata hai."""
+    if not TT_RE.search(url):
+        return []
+    loop = asyncio.get_running_loop()
+
+    def _run():
+        try:
+            r = requests.get("https://www.tikwm.com/api/", params={"url": url}, timeout=20)
+            data = r.json()
+        except Exception:
+            return []
+        if data.get("code") != 0:
+            return []
+        d = data.get("data") or {}
+        play_url = d.get("hdplay") or d.get("play")
+        if not play_url:
+            return []
+        try:
+            vid = requests.get(play_url, timeout=120)
+            vid.raise_for_status()
+        except Exception:
+            return []
+        fname = os.path.join(download_dir, f"tt_{user_id}_{int(time.time() * 1000)}.mp4")
+        with open(fname, "wb") as f:
+            f.write(vid.content)
+        return [fname]
+
+    return await loop.run_in_executor(_EXEC, _run)
+
+
+async def download_with_cobalt(url: str, download_dir: str, user_id: int) -> List[str]:
+    """Cobalt API — universal last-resort fallback (YouTube/Insta/X/TikTok/
+    Reddit/etc). Public instance ki availability/limits samay ke saath badal
+    sakti hai, isliye ye chain me sabse aakhri me try hota hai."""
+    loop = asyncio.get_running_loop()
+
+    def _run():
+        headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        if COBALT_API_KEY:
+            headers["Authorization"] = f"Api-Key {COBALT_API_KEY}"
+        try:
+            resp = requests.post(COBALT_API_URL, json={"url": url}, headers=headers, timeout=30)
+            data = resp.json()
+        except Exception:
+            return []
+
+        status = data.get("status")
+        urls = []
+        if status in ("stream", "redirect", "tunnel") and data.get("url"):
+            urls = [data["url"]]
+        elif status == "picker":
+            urls = [item["url"] for item in data.get("picker", []) if item.get("url")]
+
+        files = []
+        for i, u in enumerate(urls):
+            try:
+                r = requests.get(u, timeout=180)
+                r.raise_for_status()
+                ctype = r.headers.get("Content-Type", "")
+                ext = ".mp4" if "video" in ctype else (".jpg" if "image" in ctype else ".bin")
+                fname = os.path.join(download_dir, f"cb_{user_id}_{int(time.time() * 1000)}_{i}{ext}")
+                with open(fname, "wb") as f:
+                    f.write(r.content)
+                files.append(fname)
+            except Exception:
+                continue
+        return files
+
+    return await loop.run_in_executor(_EXEC, _run)
+
+
+def pick_engines(url: str) -> list:
+    """URL dekh kar sahi order me engines chunta hai — platform-specific
+    engine pehle, fir generic fallbacks."""
+    if INST_RE.search(url):
+        return [download_with_instaloader, download_with_gallery_dl, download_with_ytdlp_multi, download_with_cobalt]
+    if TT_RE.search(url):
+        return [download_with_tikwm, download_with_ytdlp_multi, download_with_gallery_dl, download_with_cobalt]
+    if YT_RE.search(url):
+        return [download_with_ytdlp_multi, download_with_cobalt]
+    if X_RE.search(url) or PIN_RE.search(url) or REDDIT_RE.search(url) or FB_RE.search(url):
+        return [download_with_gallery_dl, download_with_ytdlp_multi, download_with_cobalt]
+    # Koi bhi aur/unknown site — sabse generic engines try karo.
+    return [download_with_gallery_dl, download_with_ytdlp_multi, download_with_cobalt]
+
+
+async def download_media(url: str, download_dir: str, user_id: int) -> List[str]:
+    """Engines ko order me try karta hai, jo pehla non-empty result de wahi
+    return hota hai. Sab fail ho jayein to last exception raise karta hai."""
+    last_err: Optional[Exception] = None
+    for engine in pick_engines(url):
+        try:
+            files = await engine(url, download_dir, user_id)
+            if files:
+                return files
+        except Exception as e:
+            last_err = e
+            logger.warning(f"{engine.__name__} fail hua: {e}")
+            continue
+    if last_err:
+        raise last_err
+    raise RuntimeError("Koi bhi engine is link ko download nahi kar paya.")
+
 # ----------------- Utils -----------------
 
 def human_size(n: int) -> str:
@@ -276,6 +509,10 @@ URL_RE = re.compile(r"https?://[\w./?=&%-]+")
 INST_RE = re.compile(r"(instagram\.com|instagr\.am)")
 X_RE = re.compile(r"(x\.com|twitter\.com|t\.co)")
 YT_RE = re.compile(r"(youtube\.com|youtu\.be)")
+TT_RE = re.compile(r"(tiktok\.com)")
+PIN_RE = re.compile(r"(pinterest\.com|pin\.it)")
+REDDIT_RE = re.compile(r"(reddit\.com|redd\.it)")
+FB_RE = re.compile(r"(facebook\.com|fb\.watch)")
 
 def is_command_text(text: Optional[str]) -> bool:
     return bool(text and text.startswith("/"))
@@ -324,14 +561,15 @@ if "fsub_channel_id" in _saved_settings:
 # are used until the admin overrides one; overrides are persisted in the
 # same `settings` table (key = "msg_<name>") so they survive restarts.
 DEFAULT_MESSAGES = {
-    "welcome_msg": "`X Insta YT` ka koi 1 video **Link** 🔗 do.",
+    "welcome_msg": "`Insta X YT TikTok Pinterest Reddit FB` ka koi 1 **Link** 🔗 do.",
     "verify_msg": "🗝️",
     "verified_msg": "✅",
     "gm_msg": "☀️",
     "help_msg": (
         "🤖 Help:\n"
-        "🔗 Insta/X/YouTube links bhejo.\n"
+        "🔗 Instagram/X/YouTube/TikTok/Pinterest/Reddit/Facebook links bhejo.\n"
         "⬇️ Mai download karke file bhej dunga (agar Telegram allow kare).\n"
+        "🖼️ Instagram carousel (multiple photos/videos) bhi sabhi files bhej deta hai.\n"
         "📞 Agar bahut badi file hui to contact admin @KissuADMIN.\n"
     ),
     "about_msg": (
@@ -704,7 +942,10 @@ async def download_handler(client: Client, message: Message):
         return
     url = None
     for u in urls:
-        if INST_RE.search(u) or X_RE.search(u) or YT_RE.search(u):
+        if (
+            INST_RE.search(u) or X_RE.search(u) or YT_RE.search(u)
+            or TT_RE.search(u) or PIN_RE.search(u) or REDDIT_RE.search(u) or FB_RE.search(u)
+        ):
             url = u
             break
     if not url:
@@ -733,23 +974,36 @@ async def download_handler(client: Client, message: Message):
         await _safe_edit(status_msg, "🚫")
         return
 
-    filename = None
+    filenames: list = []
     try:
-        filename, info = await download_with_yt_dlp(url, DOWNLOAD_DIR, filename_prefix=f"{message.from_user.id}_")
-        filesize = os.path.getsize(filename)
-        await _safe_edit(status_msg, "📤")
+        filenames = await download_media(url, DOWNLOAD_DIR, message.from_user.id)
+        if not filenames:
+            await _safe_edit(status_msg, "❌ Is link se kuch download nahi ho paya (sab engines fail ho gaye).")
+            return
 
+        await _safe_edit(status_msg, "📤")
         limit_bytes = _bot_settings["upload_limit_mb"] * 1024 * 1024
-        try:
-            if filesize <= limit_bytes:
-                try:
-                    await message.reply_video(video=filename, quote=True)
-                except Exception:
-                    await message.reply_document(document=filename, quote=True)
-            else:
-                await message.reply_document(document=filename, quote=True)
-        except Exception:
-            await message.reply_text("⚠️")
+
+        for fname in filenames:
+            try:
+                filesize = os.path.getsize(fname)
+                ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
+                is_photo = ext in ("jpg", "jpeg", "png", "webp")
+                is_video = ext in ("mp4", "mkv", "mov", "webm", "avi")
+
+                if filesize > limit_bytes:
+                    await message.reply_document(document=fname, quote=True)
+                elif is_photo:
+                    await message.reply_photo(photo=fname, quote=True)
+                elif is_video:
+                    try:
+                        await message.reply_video(video=fname, quote=True)
+                    except Exception:
+                        await message.reply_document(document=fname, quote=True)
+                else:
+                    await message.reply_document(document=fname, quote=True)
+            except Exception:
+                logger.exception(f"File bhejne me fail hua: {fname}")
 
         await status_msg.delete()
         await add_download(message.from_user.id)
@@ -761,9 +1015,14 @@ async def download_handler(client: Client, message: Message):
         except Exception:
             pass
     finally:
-        if filename and os.path.exists(filename):
+        for fname in filenames:
             try:
-                os.remove(filename)
+                if os.path.exists(fname):
+                    os.remove(fname)
+                parent = os.path.dirname(fname)
+                # instaloader/gallery-dl temp sub-folders khaali hone par saaf kar do
+                if parent and parent != os.path.normpath(DOWNLOAD_DIR) and os.path.isdir(parent) and not os.listdir(parent):
+                    os.rmdir(parent)
             except Exception:
                 pass
 

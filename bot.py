@@ -564,7 +564,6 @@ DEFAULT_MESSAGES = {
     "welcome_msg": "`Insta X YT TikTok Pinterest Reddit FB` ka koi 1 **Link** 🔗 do.",
     "verify_msg": "🗝️",
     "verified_msg": "✅",
-    "gm_msg": "☀️",
     "help_msg": (
         "🤖 Help:\n"
         "🔗 Instagram/X/YouTube/TikTok/Pinterest/Reddit/Facebook links bhejo.\n"
@@ -586,7 +585,6 @@ MESSAGE_LABELS = {
     "welcome_msg": "👋 Welcome Message",
     "verify_msg": "🗝️ Verify / Join Message",
     "verified_msg": "🎉 Verified Success Message",
-    "gm_msg": "☀️ Good Morning Message",
     "help_msg": "❓ Help Message",
     "about_msg": "ℹ️ About Message",
 }
@@ -1035,23 +1033,9 @@ async def _safe_edit(msg: Message, text: str):
 # ----------------- Scheduler tasks -----------------
 # scheduler is created inside _run(), same reason as the Client — see note above.
 
-async def send_good_morning():
-    text = render_msg("gm_msg")
-    for uid in await get_all_user_ids():
-        try:
-            await app.send_message(uid, text)
-            await asyncio.sleep(0.1)
-        except Exception:
-            pass
-
 def schedule_jobs(scheduler: AsyncIOScheduler):
     # cleanup at 03:05 daily
     scheduler.add_job(lambda: cleanup_old_files(DOWNLOAD_DIR, days=3), CronTrigger(hour=3, minute=5))
-    # morning message at 06:00 — AsyncIOScheduler coroutine functions ko seedha
-    # schedule kar sakta hai; asyncio.create_task() ka manual wrapping crash
-    # karta tha kyunki scheduler ka job apne thread me chalta hai jaha koi
-    # running event loop nahi hota.
-    scheduler.add_job(send_good_morning, CronTrigger(hour=6, minute=0))
 
 # ----------------- Run -----------------
 
